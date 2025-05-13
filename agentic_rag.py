@@ -15,9 +15,13 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import ChatOpenAI
 from langchain_core.documents import Document
+from langchain.docstore.document import Document
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from operator import itemgetter
 
+from finance_metrics import load_formulas, identify_metric, get_required_fields, compute_metric
+from plot_metric import plot_metric
+from langchain.schema import Document
 
 
 load_dotenv()
@@ -30,33 +34,38 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 os.environ["OPENAI_API_KEY"] = OPENAI_KEY
 os.environ["TAVILY_API_KEY"] = TAVILY_API_KEY
 
-##=================================BUILD A VECTOR DB FOR WEKIPEDIA DATA=================================##
+##=================================BUILD A VECTOR DB FOR CSV DATA=================================##
+from langchain_openai import OpenAIEmbeddings
 openai_embed_model = OpenAIEmbeddings(model='text-embedding-3-small')
 
-wikipedia_filepath = 'D:\HK2_2024_2025\Data Platform\Thuc_hanh\CK\chatbot-finacial-langgraph\data\simplewiki-2020-11-01.jsonl.gz'
-docs = []
-with gzip.open(wikipedia_filepath, 'rt', encoding='utf8') as fIn:
-    for line in fIn:
-        data = json.loads(line.strip())
-        # Add documents
-        docs.append({
-            'metadata': {
-                'title': data.get('title'),
-                'article_id': data.get('id')
-            },
-            'data': ' '.join(data.get('paragraphs')[0:3])  # restrict data to first 3 paragraphs to run later modules faster
-            })
-docs = [doc for doc in docs for x in ['india'] if x in doc['data'].lower().split()]
-docs = [Document(page_content=doc['data'], metadata=doc['metadata']) for doc in docs]
-splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=300)
+
+companies_df = pd.read_csv("Data Kien/djia_companies_20250426.csv")
+companies_df.head()
+
+docs = [
+    Document(
+        page_content=row['description'],
+        metadata={'symbol': row['symbol'], 'name': row['name'], 'sector': row['sector']}
+    )
+    for _, row in companies_df.iterrows()
+]
+
+splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
 chunked_docs = splitter.split_documents(docs)
 
-chroma_db = Chroma.from_documents(documents=chunked_docs, collection_name='rag_wikipedia_db',embedding=openai_embed_model, collection_metadata={"hnsw:space": "cosine"}, persist_directory="./wikipedia_db")
+embed_model = OpenAIEmbeddings(model='text-embedding-3-small')
 
-# set up a vector database retriever
-similarity_threshold_retriever = chroma_db.as_retriever(search_type="similarity_score_threshold", search_kwargs={"k": 3, "score_threshold": 0.3})
+from langchain_chroma import Chroma
 
-# Create a query retrieval chain
+chroma_db = Chroma.from_documents(
+    documents=chunked_docs,
+    embedding=embed_model,
+    collection_name='djia_company_info',
+    persist_directory="./djia_vector_db"
+)
+similarity_threshold_retriever  = chroma_db.as_retriever(search_type="similarity_score_threshold", search_kwargs={"k": 3, "score_threshold": 0.3})
+
+##=================================Create a Query Retrieval Grader=================================##
 llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
 
 # Parser
@@ -74,6 +83,7 @@ grade_prompt = ChatPromptTemplate.from_messages([
     ("human", "Retrieved document:\n{document}\n\nUser question:\n{question}")
 ])
 
+# Tạo chain xử lý
 doc_grader = grade_prompt | llm | parser
 
 ##=================================BUILD A QA RAG CHAIN=================================##
@@ -138,9 +148,10 @@ question_rewriter = (re_write_prompt|llm|StrOutputParser())
 
 
 ##=================================LOAD WEB SEARCH TOOL=================================##
-# Load Web Search Tool
 from langchain_community.tools.tavily_search import TavilySearchResults
 tv_search = TavilySearchResults(max_results=3, search_depth='advanced', max_tokens=10000)
+
+##=================================SQL Query=================================##
 
 load_dotenv()
 
@@ -176,7 +187,7 @@ def get_schema_and_samples(conn):
         for (table,) in tables:
             cursor.execute(f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{table}';")
             schema_info[table] = [{"column_name": col, "data_type": dtype} for col, dtype in cursor.fetchall()]
-            cursor.execute(f"SELECT * FROM {table} LIMIT 3;")
+            cursor.execute(f'SELECT * FROM "{table}" LIMIT 3;')
             sample_rows = cursor.fetchall()
             colnames = [desc[0] for desc in cursor.description]
             schema_info[f"{table}_samples"] = [dict(zip(colnames, row)) for row in sample_rows]
@@ -185,34 +196,44 @@ def get_schema_and_samples(conn):
     except Exception as e:
         return {"error": str(e)}
 
-def load_metadata():
-    try:
-        with open("metadata.yml", "r") as file:
-            return yaml.safe_load(file)
-    except FileNotFoundError:
-        return {}
-
 def generate_sql_query(user_question, schema_info=None):
     prompt = f"""
-You are a PostgreSQL expert working with a single table called `stocks`.
+You are a PostgreSQL expert. You are working with a financial database containing two structured tables: "djia_prices" and "djia_companies".
 
-This table contains daily stock information with the following columns:
+IMPORTANT:
+PostgreSQL is case-sensitive **only when using quoted identifiers**.
+You MUST wrap column names in double quotes (e.g. "Ticker", "Close", "Date", etc.)
+Do NOT use unquoted identifiers like Ticker or Close - they will cause errors.
 
-- date: Date of the record (format: YYYY-MM-DD)
-- price: The closing price of the stock on that date (FLOAT)
-- open: The opening price of the stock on that date (FLOAT)
-- high: The highest price of the stock on that date (FLOAT)
-- low: The lowest price of the stock on that date (FLOAT)
-- volume: Trading volume (format: float + 'M' suffix for millions)
-- change_percent: Daily percentage change in stock price (can be positive or negative)
+Table 1: "djia_prices" - Daily stock trading data per company
+- "Date" (TIMESTAMPTZ): The timestamp of the trading day.
+- "Open" (FLOAT): Opening price of the stock on that day.
+- "High" (FLOAT): Highest price reached during the trading day.
+- "Low" (FLOAT): Lowest price of the stock during the trading day.
+- "Close" (FLOAT): Closing price of the stock on that day.
+- "Volume" (BIGINT): Number of shares traded on that day.
+- "Dividends" (FLOAT): Dividend payout on that day, if any.
+- "Stock_Splits" (FLOAT): Stock split ratio applied on that day (e.g. 2.0 = 2-for-1 split).
+- "Ticker" (VARCHAR): The stock symbol of the company (e.g., AAPL, MSFT).
 
-Assume this table is already in a PostgreSQL database as `stocks`.
+Table 2: "djia_companies" - Company profile information
+- "symbol" (VARCHAR): The stock symbol matching the "Ticker" in "djia_prices".
+- "name" (TEXT): Full name of the company.
+- "sector" (TEXT): Main sector of operation (e.g., Technology, Healthcare).
+- "industry" (TEXT): More specific industry classification (e.g., Consumer Electronics).
+- "country" (TEXT): Country where the company is headquartered.
+- "market_cap" (FLOAT): Market capitalization in USD.
+- "pe_ratio" (FLOAT): Price-to-Earnings ratio of the company.
+- "dividend_yield" (FLOAT): Annual dividend yield expressed as a percentage.
+- "description" (TEXT): A short textual description of the company's operations.
+
+Use this schema to write the most accurate and optimized PostgreSQL query to answer the following question.
+
+Do NOT format the query in markdown or explain the result.
+Return ONLY the raw SQL.
 
 User Question:
 {user_question}
-
-Write a correct and optimized PostgreSQL query to answer this question. 
-Do not explain or wrap the query in markdown. Just return raw SQL.
     """
 
     try:
@@ -224,17 +245,18 @@ Do not explain or wrap the query in markdown. Just return raw SQL.
         sql_query = re.sub(r'^```sql', '', sql_query).strip('` \n')
         return sql_query
     except Exception as e:
-        print(f"Lỗi sinh SQL: {e}")
+        print(f"❌ Lỗi sinh SQL: {e}")
         return None
+
 
 def execute_sql_query(conn, query):
     try:
         df = pd.read_sql(query, conn)
         return df
     except Exception as e:
-        print(f"Lỗi thực thi SQL: {e}")
+        print(f"❌ Lỗi thực thi SQL: {e}")
         return None
-    
+
 def run_chat(question: str):
     conn = connect_to_database()
     if conn is None:
@@ -244,17 +266,17 @@ def run_chat(question: str):
     sql_query = generate_sql_query(question, schema_info)
 
     if not sql_query:
-        print("Không thể sinh truy vấn SQL.")
+        print("❌ Không thể sinh truy vấn SQL.")
         return
 
-    print(f"\nSQL sinh ra:\n{sql_query}")
+    print(f"\n🧠 SQL sinh ra:\n{sql_query}")
     results = execute_sql_query(conn, sql_query)
 
     if results is None:
-        print("Truy vấn lỗi.")
+        print("❌ Truy vấn lỗi.")
         return
 
-    print("\nDữ liệu:")
+    print("\n📊 Kết quả:")
     print(results.head(5))
 
     conn.close()
@@ -263,201 +285,166 @@ def run_chat(question: str):
 # Graph state
 from typing import List
 from typing_extensions import TypedDict
+from langchain.schema import Document
+
 class GraphState(TypedDict):
     question: str
     generation: str
     web_search_needed: str
-    documents: List[str]
-documents: List[str]
+    use_sql: str
+    documents: List[Document]
 
 # Retrieve function for retrieval from Vector DB
 def retrieve(state):
-	print("---RETRIEVAL FROM VECTOR DB---")
-	question = state["question"]
-	# Retrieval
-	documents = similarity_threshold_retriever.invoke(question)
-	return {"documents": documents, "question": question}
-
+    print("---RETRIEVAL FROM VECTOR DB---")
+    question = state["question"]
+    # Retrieval
+    documents = similarity_threshold_retriever.invoke(question)
+    return {
+        "documents": documents,
+        "question": question,
+        "generation": "",
+        "web_search_needed": "No",
+        "use_sql": "No"
+    }
 
 # Grade documents 
 def grade_documents(state):
-	print("---CHECK DOCUMENT RELEVANCE TO QUESTION---")
-	question = state["question"]
-	documents = state["documents"]
+    print("---CHECK DOCUMENT RELEVANCE TO QUESTION---")
+    question = state["question"]
+    documents = state["documents"]
 
-	filtered_docs = []
-	web_search_needed = "No"
-	use_sql = "No"
+    filtered_docs = []
+    web_search_needed = "No"
+    use_sql = "No"
 
-	if documents:
-		for d in documents:
-			score = doc_grader.invoke(
-				{"question": question, "document": d.page_content}
-			)
-			grade = score.strip().lower()
+    if documents:
+        for d in documents:
+            score = doc_grader.invoke(
+                {"question": question, "document": d.page_content}
+            )
+            grade = score.strip().lower()
 
-			if grade == "yes":
-				print("---GRADE: DOCUMENT RELEVANT---")
-				filtered_docs.append(d)
-			else:
-				# Phân loại theo nội dung
-				if "database" in question.lower() or "truy vấn" in question.lower() or "from table" in question.lower():
-					use_sql = "Yes"
-					print("---GRADE: DOCUMENT NOT RELEVANT, SUGGEST SQL---")
-				else:
-					web_search_needed = "Yes"
-					print("---GRADE: DOCUMENT NOT RELEVANT, SUGGEST WEB SEARCH---")
-	else:
-		# Kiểm tra nội dung câu hỏi → có chứa từ khóa SQL
-		if "database" in question.lower() or "truy vấn" in question.lower() or "from table" in question.lower():
-			use_sql = "Yes"
-			print("---NO DOCS, BUT QUESTION SUGGESTS SQL---")
-		else:
-			web_search_needed = "Yes"
+            if grade == "yes":
+                print("---GRADE: DOCUMENT RELEVANT---")
+                filtered_docs.append(d)
+            else:
+                # Phân loại theo nội dung
+                if "database" in question.lower() or "truy vấn" in question.lower() or "from table" in question.lower():
+                    use_sql = "Yes"
+                    print("---GRADE: DOCUMENT NOT RELEVANT, SUGGEST SQL---")
+                else:
+                    web_search_needed = "Yes"
+                    print("---GRADE: DOCUMENT NOT RELEVANT, SUGGEST WEB SEARCH---")
+    else:
+        # Kiểm tra nội dung câu hỏi → có chứa từ khóa SQL
+        if "database" in question.lower() or "truy vấn" in question.lower() or "from table" in question.lower():
+            use_sql = "Yes"
+            print("---NO DOCS, BUT QUESTION SUGGESTS SQL---")
+        else:
+            web_search_needed = "Yes"
 
-	return {
-		"documents": filtered_docs,
-		"question": question,
-		"web_search_needed": web_search_needed,
-		"use_sql": use_sql
-	}
+    return {
+        "documents": filtered_docs,
+        "question": question,
+        "web_search_needed": web_search_needed,
+        "use_sql": use_sql,
+        "generation": ""
+    }
 
 # rewrite query
 def rewrite_query(state):
-    """
-    Rewrite the query to produce a better question.
-    Args:
-    state (dict): The current graph state
-    Returns:
-    state (dict): Updates question key with a re-phrased or re-written question
-    """
     print("---REWRITE QUERY---")
     question = state["question"]
     documents = state["documents"]
     # Re-write question
     better_question = question_rewriter.invoke({"question": question})
-    return {"documents": documents, "question": better_question}
-
+    return {
+        "documents": documents,
+        "question": better_question,
+        "web_search_needed": state.get("web_search_needed", "No"),
+        "use_sql": state.get("use_sql", "No"),
+        "generation": ""
+    }
 
 # web search
-from langchain.schema import Document
 def web_search(state):
-    """
-    Web search based on the re-written question.
-    Args:
-    state (dict): The current graph state
-    Returns:
-    state (dict): Updates documents key with appended web results
-    """
     print("---WEB SEARCH---")
     question = state["question"]
     documents = state["documents"]
 
-    # Web search
-    docs = tv_search.invoke(question)
-    
-    # Gỡ lỗi: kiểm tra cấu trúc trả về
-    print("DOCS TYPE:", type(docs))
-    print("FIRST ELEMENT TYPE:", type(docs[0]) if docs else "EMPTY")
+    try:
+        # Web search
+        docs = tv_search.invoke(question)
+        
+        # Gỡ lỗi: kiểm tra cấu trúc trả về
+        print("DOCS TYPE:", type(docs))
+        print("FIRST ELEMENT TYPE:", type(docs[0]) if docs else "EMPTY")
 
-    # Nếu docs là list of strings
-    if isinstance(docs[0], str):
-        web_content = "\n\n".join(docs)
-    # Nếu docs là list of dicts
-    elif isinstance(docs[0], dict) and "content" in docs[0]:
-        web_content = "\n\n".join([d["content"] for d in docs])
-    # Nếu docs là list of Document
-    elif isinstance(docs[0], Document):
-        web_content = "\n\n".join([d.page_content for d in docs])
-    else:
-        raise TypeError("Unsupported doc format")
+        # Nếu docs là list of strings
+        if isinstance(docs[0], str):
+            web_content = "\n\n".join(docs)
+        # Nếu docs là list of dicts
+        elif isinstance(docs[0], dict) and "content" in docs[0]:
+            web_content = "\n\n".join([d["content"] for d in docs])
+        # Nếu docs là list of Document
+        elif isinstance(docs[0], Document):
+            web_content = "\n\n".join([d.page_content for d in docs])
+        else:
+            raise TypeError("Unsupported doc format")
 
-    web_results = Document(page_content=web_content)
-    documents.append(web_results)
+        web_results = Document(page_content=web_content)
+        documents.append(web_results)
+    except Exception as e:
+        print(f"Error during web search: {e}")
+        web_results = Document(page_content=f"Error during web search: {str(e)}")
+        documents.append(web_results)
 
-    return {"documents": documents, "question": question}
+    return {
+        "documents": documents,
+        "question": question,
+        "web_search_needed": "No",
+        "use_sql": state.get("use_sql", "No"),
+        "generation": ""
+    }
 
-
-# Use SQL
-from finance_metrics import load_formulas, identify_metric, get_required_fields, compute_metric
-from plot_metric import plot_metric
 from langchain.schema import Document
 import pandas as pd
 
-
 def query_sql(state):
-    print("---EXECUTE SQL QUERY OR METRIC COMPUTATION---")
+    print("---EXECUTE RAW SQL QUERY---")
     question = state["question"]
 
-    # Kết nối đến cơ sở dữ liệu
+    # Kết nối đến DB
     conn = connect_to_database()
     if conn is None:
         raise ValueError("Không thể kết nối cơ sở dữ liệu.")
 
+    # Sinh câu truy vấn SQL
     schema_info = get_schema_and_samples(conn)
-    metadata = load_formulas()
-    category, metric_name = identify_metric(question, metadata)
-
-    # Nếu là câu hỏi về chỉ số tài chính
-    if metric_name:
-        print(f"Phát hiện truy vấn liên quan đến chỉ số: {metric_name}")
-        required_fields = get_required_fields(category, metric_name, metadata)
-
-        # TA metrics - cần vẽ biểu đồ
-        if metric_name in ["RSI", "MACD", "MA", "BollingerBands"]:
-            df = pd.read_sql("SELECT date, price FROM stocks ORDER BY date ASC LIMIT 100", conn)
-            conn.close()
-
-            image_base64 = plot_metric(metric_name, df)
-            result_doc = Document(
-                page_content=f"Biểu đồ {metric_name}:",
-                metadata={"image_base64": image_base64}
-            )
-
-            return {
-                "documents": state["documents"] + [result_doc],
-                "question": question
-            }
-
-        # FA metrics - tính toán dựa trên 1 dòng dữ liệu
-        else:
-            field_clause = ", ".join(required_fields)
-            query = f"SELECT {field_clause} FROM stocks LIMIT 1;"
-            df = pd.read_sql(query, conn)
-            conn.close()
-
-            if df.empty:
-                result_str = f"Không tìm thấy đủ dữ liệu để tính {metric_name}."
-            else:
-                row = df.iloc[0].to_dict()
-                result = compute_metric(metric_name, row)
-                result_str = f"{metric_name} = {result}"
-
-            return {
-                "documents": state["documents"] + [Document(page_content=result_str)],
-                "question": question
-            }
-
-    # Truy vấn SQL thông thường
     sql_query = generate_sql_query(question, schema_info)
     if not sql_query:
+        conn.close()
         raise ValueError("Không thể sinh truy vấn SQL từ câu hỏi.")
 
+    # Thực thi
     results = execute_sql_query(conn, sql_query)
     conn.close()
 
+    # ✅ Xử lý kết quả
     if results is None or results.empty:
-        content = "Không có kết quả từ truy vấn SQL."
+        content = "⚠️ Không có kết quả từ truy vấn SQL."
     else:
-        content = results.to_markdown(index=False)  # hoặc `.to_string(index=False)` nếu không muốn bảng Markdown
+        content = (
+            f"📊 Kết quả từ truy vấn SQL:\n\n{results.to_markdown(index=False)}"
+        )
 
-    # Gán vào document để các bước sau có thể sinh câu trả lời
+    # ✅ Gắn vào document và lưu lại SQL truy vấn nếu cần
     doc = Document(page_content=content)
-
-    # Cập nhật state
     return {
         "documents": state["documents"] + [doc],
-        "question": question
+        "question": question,
+        "sql_query": sql_query  # ⬅️ tùy chọn: nếu muốn dùng lại sau
     }
 
 
@@ -467,55 +454,127 @@ def generate_answer(state):
     question = state["question"]
     documents = state["documents"]
     # RAG generation
-    generation = qa_rag_chain.invoke({"context": documents, "question": question})
-    return {"documents": documents, "question": question,"generation": generation}
+    try:
+        generation = qa_rag_chain.invoke({"context": documents, "question": question})
+    except Exception as e:
+        generation = f"Error generating answer: {str(e)}"
+    
+    return {
+        "documents": documents,
+        "question": question,
+        "generation": generation,
+        "web_search_needed": state.get("web_search_needed", "No"),
+        "use_sql": state.get("use_sql", "No")
+    }
 
+# Compute FA and TA
+from langgraph.graph import END, StateGraph
+from langchain.schema import Document
+from finance_metrics import load_formulas, identify_metric, get_required_fields, compute_metric
+from plot_metric import plot_metric
+import pandas as pd
 
-# decide to generate
-def decide_to_generate(state):
-    print("---ASSESS GRADED DOCUMENTS---")
-    web_search_needed = state.get("web_search_needed", "No")
-    use_sql = state.get("use_sql", "No")
+# --- Node: compute_fa ---
+def compute_fa(state):
+    question = state["question"]
+    conn = connect_to_database()
+    metadata = load_formulas()
+    _, metric_name = identify_metric(question, metadata)
+    required_fields = get_required_fields("FA", metric_name, metadata)
 
-    if use_sql == "Yes":
-        print("---DECISION: QUERY SQL DATABASE---")
-        return "query_sql"  # Bạn cần tạo node mới: `query_sql`
+    query = f"SELECT {', '.join(required_fields)} FROM djia_companies WHERE symbol = 'AAPL' LIMIT 1;"
+    df = pd.read_sql(query, conn)
+    conn.close()
 
-    elif web_search_needed == "Yes":
-        print("---DECISION: WEB SEARCH NEEDED, REWRITE QUERY---")
-        return "rewrite_query"
-
+    if df.empty:
+        result_str = f"⚠️ Không tìm thấy đủ dữ liệu để tính {metric_name}."
     else:
-        print("---DECISION: DOCUMENTS ARE RELEVANT, GENERATE ANSWER---")
-        return "generate_answer"
+        result = compute_metric(metric_name, df.iloc[0].to_dict())
+        result_str = f"{metric_name} = {result}"
+
+    return {
+        "documents": state["documents"] + [Document(page_content=result_str)],
+        "question": question
+    }
+
+def compute_ta(state):
+    question = state["question"]
+    conn = connect_to_database()
+    metadata = load_formulas()
+    _, metric_name = identify_metric(question, metadata)
+
+    df = pd.read_sql('SELECT "Date", "Close" FROM djia_prices WHERE "Ticker" = \'AAPL\' ORDER BY "Date" ASC LIMIT 100', conn)
+    conn.close()
+    df.rename(columns={"Date": "date", "Close": "price"}, inplace=True)
+
+    image_base64 = plot_metric(metric_name, df)
+    result_doc = Document(
+        page_content=f"Biểu đồ {metric_name} cho AAPL:",
+        metadata={"image_base64": image_base64}
+    )
+    return {
+        "documents": state["documents"] + [result_doc],
+        "question": question
+    }
+
+# Decision node
+def decide_branch(state):
+    question = state["question"].lower()
+    metadata = load_formulas()
+    _, metric = identify_metric(question, metadata)
+
+    if metric in ["RSI", "MACD", "MA", "BollingerBands"]:
+        return "compute_ta"
+    elif metric in ["EPS", "PE", "ROE", "DebtRatio"]:
+        return "compute_fa"
+
+    try:
+        schema_info = get_schema_and_samples(connect_to_database())
+        sql_query = generate_sql_query(question, schema_info)
+        if sql_query:
+            return "query_sql"
+    except Exception:
+        pass
+
+    return "rewrite_query"
 
 
 ##=================================BUILD THE AGENT GRAPH WITH LANGGRAPH=================================##
 from langgraph.graph import END, StateGraph
+# --- Build the agent graph ---
 agentic_rag = StateGraph(GraphState)
-# Define the nodes
-agentic_rag.add_node("retrieve", retrieve) # retrieve
-agentic_rag.add_node("grade_documents", grade_documents) # grade documents
-agentic_rag.add_node("rewrite_query", rewrite_query) # transform_query
-agentic_rag.add_node("web_search", web_search) # web search
-agentic_rag.add_node("query_sql", query_sql) 
-agentic_rag.add_node("generate_answer", generate_answer) # generate answer
-# Build graph
+
+# Add nodes
+agentic_rag.add_node("retrieve", retrieve)
+agentic_rag.add_node("grade_documents", grade_documents)
+agentic_rag.add_node("rewrite_query", rewrite_query)
+agentic_rag.add_node("web_search", web_search)
+agentic_rag.add_node("query_sql", query_sql)
+agentic_rag.add_node("compute_ta", compute_ta)
+agentic_rag.add_node("compute_fa", compute_fa)
+agentic_rag.add_node("generate_answer", generate_answer)
+
+# Set flow
 agentic_rag.set_entry_point("retrieve")
 agentic_rag.add_edge("retrieve", "grade_documents")
-# Quyết định nhánh tiếp theo sau khi chấm điểm tài liệu
+
 agentic_rag.add_conditional_edges(
     "grade_documents",
-    decide_to_generate,
+    decide_branch,
     {
-        "rewrite_query": "rewrite_query",
-        "generate_answer": "generate_answer",
-        "query_sql": "query_sql"
+        "compute_ta": "compute_ta",
+        "compute_fa": "compute_fa",
+        "query_sql": "query_sql",
+        "rewrite_query": "rewrite_query"
     }
 )
+
 agentic_rag.add_edge("rewrite_query", "web_search")
 agentic_rag.add_edge("web_search", "generate_answer")
 agentic_rag.add_edge("query_sql", "generate_answer")
+agentic_rag.add_edge("compute_fa", "generate_answer")
+agentic_rag.add_edge("compute_ta", "generate_answer")
 agentic_rag.add_edge("generate_answer", END)
+
 # Compile
 agentic_rag = agentic_rag.compile()

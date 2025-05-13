@@ -1,35 +1,62 @@
 import gradio as gr
 from langchain.schema import Document
-from agentic_rag import agentic_rag  # Đảm bảo bạn đã import đúng graph
+from agentic_rag import create_rag_graph  # Import the graph creation function
 import base64
+import traceback
 
 
 def format_response(response):
-    docs = response.get("documents", [])
-    generation = response.get("generation", "Không có câu trả lời.")
+    try:
+        docs = response.get("documents", [])
+        generation = response.get("generation", "Không có câu trả lời.")
 
-    # Nếu có ảnh được đính kèm trong metadata
-    for doc in docs:
-        image_base64 = doc.metadata.get("image_base64") if isinstance(doc, Document) else None
-        if image_base64:
-            return generation, image_base64
+        # Nếu có ảnh được đính kèm trong metadata
+        for doc in docs:
+            if isinstance(doc, Document):
+                image_base64 = doc.metadata.get("image_base64")
+                if image_base64:
+                    return generation, image_base64
 
-    return generation, None
+        return generation, None
+    except Exception as e:
+        print(f"Error formatting response: {str(e)}")
+        return f"Lỗi khi xử lý phản hồi: {str(e)}", None
 
 
 def rag_agent(query):
     try:
-        response = agentic_rag.invoke({"question": query})
+        # Create a new graph instance for each query
+        agentic_rag = create_rag_graph()
+        
+        # Initialize state with all required fields
+        initial_state = {
+            "question": query,
+            "generation": "",
+            "web_search_needed": "No",
+            "use_sql": "No",
+            "documents": []
+        }
+        
+        print(f"Processing query: {query}")
+        response = agentic_rag.invoke(initial_state)
+        print(f"Got response: {response}")
+        
         generation, image_base64 = format_response(response)
 
         if image_base64:
-            image_data = base64.b64decode(image_base64)
-            return generation, image_data
+            try:
+                image_data = base64.b64decode(image_base64)
+                return generation, image_data
+            except Exception as e:
+                print(f"Error decoding image: {str(e)}")
+                return f"{generation}\n\nLỗi khi xử lý hình ảnh: {str(e)}", None
 
         return generation, None
 
     except Exception as e:
-        return f"❌ Lỗi: {str(e)}", None
+        error_msg = f"❌ Lỗi: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+        print(error_msg)
+        return error_msg, None
 
 
 with gr.Blocks(title="Agentic RAG for Finance") as demo:

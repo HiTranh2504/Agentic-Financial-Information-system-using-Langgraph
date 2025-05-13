@@ -1,5 +1,21 @@
-.venv
+# Virtual environment
+.venv/
+venv/
+
+# Environment variables
 .env
 
-djia_vector_db/*
-djia_vector_db
+# Vector database or any large folder
+djia_vector_db/
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE/editor files
+.vscode/
+.idea/
+*.swp
