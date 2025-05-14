@@ -1,0 +1,41 @@
+FA:
+  EPS:
+    description: Earnings per Share
+    formula: Net Income / Number of Shares Outstanding
+    required_fields: ["net_income", "shares_outstanding"]
+
+  PE:
+    description: Price to Earnings Ratio
+    formula: Stock Price / EPS
+    required_fields: ["stock_price", "eps"]
+
+  ROE:
+    description: Return on Equity
+    formula: Net Income / Shareholder's Equity
+    required_fields: ["net_income", "equity"]
+
+  DebtRatio:
+    description: Debt Ratio
+    formula: Total Liabilities / Total Assets
+    required_fields: ["total_liabilities", "total_assets"]
+
+TA:
+  RSI:
+    description: Relative Strength Index
+    formula: 100 - (100 / (1 + Average Gain / Average Loss))
+    required_fields: ["price_series"]
+
+  MACD:
+    description: Moving Average Convergence Divergence
+    formula: EMA(12) - EMA(26)
+    required_fields: ["price_series"]
+
+  MA:
+    description: Moving Average
+    formula: Sum of Prices over Period / Number of Periods
+    required_fields: ["price_series"]
+
+  BollingerBands:
+    description: Bollinger Bands
+    formula: MA ± 2 * Standard Deviation
+    required_fields: ["price_series"]
