@@ -1,41 +1,29 @@
-FA:
-  EPS:
-    description: Earnings per Share
-    formula: Net Income / Number of Shares Outstanding
-    required_fields: ["net_income", "shares_outstanding"]
-
-  PE:
-    description: Price to Earnings Ratio
-    formula: Stock Price / EPS
-    required_fields: ["stock_price", "eps"]
-
-  ROE:
-    description: Return on Equity
-    formula: Net Income / Shareholder's Equity
-    required_fields: ["net_income", "equity"]
-
-  DebtRatio:
-    description: Debt Ratio
-    formula: Total Liabilities / Total Assets
-    required_fields: ["total_liabilities", "total_assets"]
-
 TA:
-  RSI:
-    description: Relative Strength Index
-    formula: 100 - (100 / (1 + Average Gain / Average Loss))
-    required_fields: ["price_series"]
-
-  MACD:
-    description: Moving Average Convergence Divergence
-    formula: EMA(12) - EMA(26)
-    required_fields: ["price_series"]
-
+  Close:
+    required_fields: ["Date", "Close"]
   MA:
-    description: Moving Average
-    formula: Sum of Prices over Period / Number of Periods
-    required_fields: ["price_series"]
+    required_fields: ["Date", "Close"]
+  DailyReturn:
+    required_fields: ["Date", "Close"]
+  CumulativeReturn:
+    required_fields: ["Date", "Close"]
+  Volume:
+    required_fields: ["Date", "Volume"]
+  HighLowRange:
+    required_fields: ["Date", "High", "Low"]
+  CorrelationMatrix:
+    required_fields: ["Date", "Close", "Ticker"]
 
-  BollingerBands:
-    description: Bollinger Bands
-    formula: MA ± 2 * Standard Deviation
-    required_fields: ["price_series"]
+FA:
+  MarketCap:
+    required_fields: ["symbol", "market_cap"]
+  PE:
+    required_fields: ["symbol", "pe_ratio"]
+  SectorDistribution:
+    required_fields: ["symbol", "sector"]
+  MarketCap_vs_PE:
+    required_fields: ["symbol", "market_cap", "pe_ratio"]
+  AvgVolume_vs_AvgClose:
+    required_fields: ["symbol", "avg_volume", "avg_close"]
+  TotalDividends:
+    required_fields: ["symbol", "dividends"]

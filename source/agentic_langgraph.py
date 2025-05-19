@@ -360,17 +360,43 @@ def grade_documents(state):
         "documents": filtered_docs
     }
 
-# Rewrite query
-def rewrite_query(state):
-    print("---REWRITE QUERY---")
-    question = state["question"]
-    documents = state["documents"]
-    # Re-write question
-    better_question = question_rewriter.invoke({"question": question})
-    return {"documents": documents, "question": better_question}
+# Use SQL
+# Danh sách 30 mã cổ phiếu DJIA (bạn có thể cập nhật thêm nếu cần)
+DJIA_TICKERS = {
+    "AAPL", "MSFT", "AMGN", "AXP", "BA", "CAT", "CRM", "CSCO", "CVX", "DIS",
+    "DOW", "GS", "HD", "HON", "IBM", "INTC", "JNJ", "JPM", "KO", "MCD",
+    "MMM", "MRK", "MSFT", "NKE", "PG", "TRV", "UNH", "V", "VZ", "WMT"
+}
+
+def extract_ticker_from_question(question: str) -> str | None:
+    """
+    Extracts stock ticker symbol from user question by matching against DJIA tickers.
+    Returns the first match found, or None if no match.
+    """
+    question = question.upper()
+    for ticker in DJIA_TICKERS:
+        if re.search(rf"\\b{ticker}\\b", question):
+            print(f"✅ Detected ticker in question: {ticker}")
+            return ticker
+    print("⚠️ No DJIA ticker found in question.")
+    return None
 
 
-# Query SQL
+def detect_chart_type(question: str):
+    q = question.lower()
+    if "scatter plot" in q:
+        return "scatter"
+    if "bar chart" in q:
+        return "bar"
+    if "pie chart" in q:
+        return "pie"
+    if "boxplot" in q:
+        return "box"
+    if "histogram" in q:
+        return "hist"
+    if "heatmap" in q:
+        return "heatmap"
+    return None
 
 def query_sql(state):
     print("---EXECUTE RAW SQL QUERY OR METRIC COMPUTATION---")
@@ -378,27 +404,32 @@ def query_sql(state):
     metadata = load_formulas()
     category, metric_name = identify_metric(question, metadata)
 
-    # Kết nối đến DB
     conn = connect_to_database()
     if conn is None:
         raise ValueError("Không thể kết nối cơ sở dữ liệu.")
 
-    # Nếu là chỉ số tài chính (FA hoặc TA)
     if metric_name:
-        print(f"📌 Nhận diện chỉ số: {metric_name} ({category})")
+        print(f"📌 Identified metric: {metric_name} ({category})")
 
-        # --- TA: Vẽ biểu đồ từ dữ liệu giá ---
         if category == "TA":
-            df = pd.read_sql(
-                'SELECT "Date", "Close" FROM djia_prices WHERE "Ticker" = \'AAPL\' ORDER BY "Date" ASC LIMIT 100',
-                conn
+            ticker = extract_ticker_from_question(question)
+            if not ticker:
+                conn.close()
+                raise ValueError("❌ Cannot determine stock ticker from the question.")
+
+            query = (
+                f'SELECT "Date", "Open", "High", "Low", "Close", "Volume" '
+                f'FROM djia_prices WHERE "Ticker" = \'{ticker}\' ORDER BY "Date" ASC'
             )
+            print(f"🧠 SQL Query:\n{query}")
+            df = pd.read_sql(query, conn)
             conn.close()
-            df.rename(columns={"Date": "date", "Close": "price"}, inplace=True)
+            df.rename(columns={"Date": "date"}, inplace=True)
+
 
             image_base64 = plot_metric(metric_name, df)
             result_doc = Document(
-                page_content=f"Biểu đồ {metric_name} cho AAPL:",
+                page_content=f"Chart of {metric_name} for AAPL:",
                 metadata={"image_base64": image_base64}
             )
             return {
@@ -406,12 +437,18 @@ def query_sql(state):
                 "question": question
             }
 
-        # --- FA: Tính toán chỉ số từ bảng công ty ---
         elif category == "FA":
+            ticker = extract_ticker_from_question(question)
+            if not ticker:
+                conn.close()
+                raise ValueError("❌ Cannot determine stock ticker from the question.")
+
             required_fields = get_required_fields(category, metric_name, metadata)
-            query = f"SELECT {', '.join(required_fields)} FROM djia_companies WHERE symbol = 'AAPL' LIMIT 1;"
+            query = f"SELECT {', '.join(required_fields)} FROM djia_companies WHERE symbol = '{ticker}' LIMIT 1;"
+            print(f"🧠 SQL Query:\n{query}")
             df = pd.read_sql(query, conn)
             conn.close()
+
 
             if df.empty:
                 result_str = f"⚠️ Không tìm thấy đủ dữ liệu để tính {metric_name}."
@@ -424,58 +461,105 @@ def query_sql(state):
                 "question": question
             }
 
-    # Trường hợp không phải chỉ số → xử lý như SQL tự nhiên
+    # Natural language → SQL case
     schema_info = get_schema_and_samples(conn)
     sql_query = generate_sql_query(question, schema_info)
     if not sql_query:
         conn.close()
-        raise ValueError("Không thể sinh truy vấn SQL từ câu hỏi.")
+        raise ValueError("❌ Cannot generate SQL query from question.")
 
-    results = execute_sql_query(conn, sql_query)
+    print(f"🧠 Generated SQL Query:\n{sql_query}")
+    df = execute_sql_query(conn, sql_query)
     conn.close()
 
-    # Nếu không có dữ liệu → yêu cầu fallback web search
-    if results is None or results.empty:
-        content = "⚠️ Không có kết quả từ truy vấn SQL."
+    if df is None or df.empty:
+        content = "⚠️ No results returned from SQL query."
         state["web_search_needed"] = "Yes"
-    else:
-        content = f"📊 Kết quả từ truy vấn SQL:\n\n{results.to_markdown(index=False)}"
+        return {
+            "documents": state["documents"],
+            "question": question,
+            "sql_query": sql_query,
+            "web_search_needed": "Yes"
+        }
 
-    doc = Document(page_content=content)
+    chart_type = detect_chart_type(question)
+    if chart_type:
+        print(f"📊 Detected chart type: {chart_type}")
+        image_base64 = plot_fa_chart(df, chart_type, question)
+        result_doc = Document(
+            page_content=f"Visualization for: {question}",
+            metadata={"image_base64": image_base64}
+        )
+    else:
+        result_doc = Document(
+            page_content=f"📊 SQL Query Result:\n\n{df.to_markdown(index=False)}"
+        )
 
     return {
-        "documents": state["documents"] + [doc],
+        "documents": state["documents"] + [result_doc],
         "question": question,
         "sql_query": sql_query,
-        "web_search_needed": state.get("web_search_needed", "No")  # vẫn duy trì trạng thái fallback
+        "web_search_needed": "No"
     }
 
 
-# Decide merge or query sql
-def decide_merge_or_sql(state):
-    docs = state.get("documents", [])
-    if len(docs) >= 1:
-        return "merge_documents"
-    return "query_sql"
 
 
-# Merge documents
-def merge_documents(state):
-    vector_docs = state.get("documents", [])
-    sql_doc = state.get("sql_result", None)
+# 
+def assess_combined_documents(state):
+    """
+    Re-assess all documents (from vector + SQL) to determine which are relevant to the question.
+    Filters out irrelevant documents based on LLM scoring.
+    """
+    print("---REASSESS COMBINED DOCUMENTS---")
 
-    if sql_doc:
-        merged_docs = vector_docs + [sql_doc]
-    else:
-        merged_docs = vector_docs
+    question = state.get("question", "")
+    all_docs = state.get("documents", [])
+
+    reassessed_docs = []
+
+    for doc in all_docs:
+        score = doc_grader.invoke({"question": question, "document": doc.page_content}).strip().lower()
+        if score == "yes":
+            print("✅ Reassessed: Relevant")
+            reassessed_docs.append(doc)
+        else:
+            print("❌ Reassessed: Not relevant")
+
+    print(f"🔍 Number of relevant documents after reassessment: {len(reassessed_docs)}")
 
     return {
         **state,
-        "documents": merged_docs
+        "documents": reassessed_docs
     }
 
 
-# Decide web search or generate answer
+def decide_after_reassessment(state):
+    """
+    After reassessing documents from both vector DB and SQL,
+    decide whether to proceed to generate an answer or fall back to web search.
+    """
+    docs = state.get("documents", [])
+    num_docs = len(docs)
+    print(f"🔍 Number of relevant documents after reassessment: {num_docs}")
+
+    if num_docs >= 1:
+        print("✅ Enough relevant documents found → proceed to generate_answer")
+        return "generate_answer"
+    else:
+        print("⚠️ Not enough relevant documents → fallback to rewrite_query")
+        return "rewrite_query"
+
+
+def rewrite_query(state):
+    print("---REWRITE QUERY---")
+    question = state["question"]
+    documents = state["documents"]
+    # Re-write question
+    better_question = question_rewriter.invoke({"question": question})
+    return {"documents": documents, "question": better_question}
+
+
 def decide_after_sql(state):
     if state.get("web_search_needed", "No") == "Yes":
         print("---DECISION: Missing SQL data → web search---")
@@ -485,85 +569,140 @@ def decide_after_sql(state):
     return "generate_answer"
 
 
-# Web search
+
+
+from langchain_core.documents import Document  # dùng đúng version core
+
 def web_search(state):
     """
-    Web search based on the re-written question.
-    Args:
-    state (dict): The current graph state
-    Returns:
-    state (dict): Updates documents key with appended web results
+    Perform web search based on the rewritten question and return a unified Document.
     """
     print("---WEB SEARCH---")
     question = state["question"]
-    documents = state["documents"]
+    documents = state.get("documents", [])
 
-    # Web search
-    docs = tv_search.invoke(question)
-    
-    # Gỡ lỗi: kiểm tra cấu trúc trả về
-    print("DOCS TYPE:", type(docs))
-    print("FIRST ELEMENT TYPE:", type(docs[0]) if docs else "EMPTY")
+    try:
+        docs = tv_search.invoke(question)
 
-    # Nếu docs là list of strings
-    if isinstance(docs[0], str):
-        web_content = "\n\n".join(docs)
-    # Nếu docs là list of dicts
-    elif isinstance(docs[0], dict) and "content" in docs[0]:
-        web_content = "\n\n".join([d["content"] for d in docs])
-    # Nếu docs là list of Document
-    elif isinstance(docs[0], Document):
-        web_content = "\n\n".join([d.page_content for d in docs])
-    else:
-        raise TypeError("Unsupported doc format")
+        if not docs:
+            print("⚠️ No results returned from web search.")
+            return {"documents": documents, "question": question}
 
-    web_results = Document(page_content=web_content)
-    documents.append(web_results)
+        print("📥 Web search results received.")
+        print("DOCS TYPE:", type(docs))
+        print("FIRST ELEMENT TYPE:", type(docs[0]) if docs else "EMPTY")
 
-    return {"documents": documents, "question": question}
+        # Format content
+        if isinstance(docs[0], str):
+            web_content = "\n\n".join(docs)
+        elif isinstance(docs[0], dict) and "content" in docs[0]:
+            web_content = "\n\n".join([d["content"] for d in docs])
+        elif isinstance(docs[0], Document):
+            web_content = "\n\n".join([d.page_content for d in docs])
+        else:
+            raise TypeError(f"Unsupported document format: {type(docs[0])}")
+
+        # Append web search result as 1 Document
+        web_results = Document(
+            page_content=web_content,
+            metadata={"source": "web_search"}
+        )
+
+        documents.append(web_results)
+        print("✅ Web search content appended to documents.")
+        return {"documents": documents, "question": question}
+
+    except Exception as e:
+        print(f"❌ Error during web search: {str(e)}")
+        return {"documents": documents, "question": question}
 
 
-# Generate Answer
 def generate_answer(state):
+    """
+    Generate final answer using question and provided context documents.
+    """
     print("---GENERATE ANSWER---")
-    question = state["question"]
-    documents = state["documents"]
-    # RAG generation
-    generation = qa_rag_chain.invoke({"context": documents, "question": question})
-    return {"documents": documents, "question": question,"generation": generation}
 
+    question = state.get("question", "")
+    documents = state.get("documents", [])
+
+    if not question:
+        print("⚠️ No question provided.")
+        return {**state, "generation": "No question was given."}
+
+    if not documents:
+        print("⚠️ No documents available for context.")
+        return {**state, "generation": "I don't have enough context to answer the question."}
+
+    try:
+        # Generate answer using the QA chain
+        generation = qa_rag_chain.invoke({
+            "context": documents,
+            "question": question
+        })
+
+        print("✅ Answer generated.")
+        return {
+            **state,
+            "generation": generation
+        }
+
+    except Exception as e:
+        print(f"❌ Error during answer generation: {str(e)}")
+        return {
+            **state,
+            "generation": f"Error generating answer: {str(e)}"
+        }
 
 # =======================Build the Agent Graph with LangGraph=======================
 
 # --- Build enhanced Agentic RAG with SQL-priority + Vector fallback + multi-hop merge ---
 def create_rag_graph():
+    from langgraph.graph import StateGraph, END
+
     agentic_rag = StateGraph(GraphState)
 
+    # Add nodes
     agentic_rag.add_node("retrieve", retrieve)
     agentic_rag.add_node("grade_documents", grade_documents)
-    agentic_rag.add_node("merge_documents", merge_documents)
     agentic_rag.add_node("query_sql", query_sql)
+    agentic_rag.add_node("assess_combined_documents", assess_combined_documents)
     agentic_rag.add_node("rewrite_query", rewrite_query)
     agentic_rag.add_node("web_search", web_search)
     agentic_rag.add_node("generate_answer", generate_answer)
 
+    # Entry point
     agentic_rag.set_entry_point("retrieve")
+
+    # Flow: retrieve → grade_documents
     agentic_rag.add_edge("retrieve", "grade_documents")
 
-    agentic_rag.add_conditional_edges("grade_documents", decide_merge_or_sql, {
-        "merge_documents": "merge_documents",
-        "query_sql": "query_sql"
-    })
+    # Sau khi grade: Nếu docs tốt → generate_answer, nếu không → query_sql
+    agentic_rag.add_conditional_edges(
+        "grade_documents",
+        lambda state: "generate_answer" if len(state.get("documents", [])) >= 1 else "query_sql",
+        {
+            "generate_answer": "generate_answer",
+            "query_sql": "query_sql"
+        }
+    )
 
-    agentic_rag.add_edge("merge_documents", "query_sql")
+    agentic_rag.add_edge("query_sql", "assess_combined_documents")
 
-    agentic_rag.add_conditional_edges("query_sql", decide_after_sql, {
-        "generate_answer": "generate_answer",
-        "rewrite_query": "rewrite_query"
-    })
+    agentic_rag.add_conditional_edges(
+        "assess_combined_documents",
+        decide_after_reassessment,  # return "generate_answer" or "rewrite_query"
+        {
+            "generate_answer": "generate_answer",
+            "rewrite_query": "rewrite_query"
+        }
+    )
 
+    # Web search flow
     agentic_rag.add_edge("rewrite_query", "web_search")
     agentic_rag.add_edge("web_search", "generate_answer")
+
+    # END
     agentic_rag.add_edge("generate_answer", END)
 
     return agentic_rag.compile()

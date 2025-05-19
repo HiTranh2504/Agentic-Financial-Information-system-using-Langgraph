@@ -1,61 +1,65 @@
 import matplotlib.pyplot as plt
+import seaborn as sns
 import base64
-from io import BytesIO
-import pandas as pd
+import io
 
-def plot_metric(metric_name: str, df: pd.DataFrame) -> str:
-    """
-    Vẽ biểu đồ tùy theo metric TA và trả về hình ảnh dưới dạng base64
-    """
+def plot_chart(df, chart_type, question):
     try:
-        prices = df["price"].reset_index(drop=True)
-        fig, ax = plt.subplots(figsize=(10, 5))
+        plt.figure(figsize=(10, 5))
 
-        if metric_name == "MA":
-            ma = prices.rolling(window=20).mean()
-            ax.plot(prices, label="Price")
-            ax.plot(ma, label="MA 20")
-            ax.set_title("Moving Average")
+        if chart_type == "line":
+            plt.plot(df["Date"], df["Close"], label="Close Price", color="blue")
+            plt.xlabel("Date")
+            plt.ylabel("Price")
+            plt.title(question)
+            plt.xticks(rotation=45)
+            plt.legend()
 
-        elif metric_name == "BollingerBands":
-            ma = prices.rolling(window=20).mean()
-            std = prices.rolling(window=20).std()
-            upper = ma + (2 * std)
-            lower = ma - (2 * std)
-            ax.plot(prices, label="Price")
-            ax.plot(ma, label="MA 20")
-            ax.fill_between(range(len(prices)), lower, upper, color="gray", alpha=0.3, label="Bollinger Bands")
-            ax.set_title("Bollinger Bands")
+        elif chart_type == "bar":
+            x_col = df.columns[0]
+            y_col = df.columns[1]
+            plt.bar(df[x_col], df[y_col], color="skyblue")
+            plt.xlabel(x_col)
+            plt.ylabel(y_col)
+            plt.title(question)
+            plt.xticks(rotation=45)
 
-        elif metric_name == "RSI":
-            delta = prices.diff()
-            gain = delta.clip(lower=0).rolling(window=14).mean()
-            loss = -delta.clip(upper=0).rolling(window=14).mean()
-            rs = gain / loss
-            rsi = 100 - (100 / (1 + rs))
-            ax.plot(rsi, label="RSI")
-            ax.axhline(70, color='red', linestyle='--')
-            ax.axhline(30, color='green', linestyle='--')
-            ax.set_title("RSI Indicator")
+        elif chart_type == "pie":
+            labels = df.iloc[:, 0]
+            values = df.iloc[:, 1]
+            plt.pie(values, labels=labels, autopct='%1.1f%%')
+            plt.title(question)
 
-        elif metric_name == "MACD":
-            ema12 = prices.ewm(span=12, adjust=False).mean()
-            ema26 = prices.ewm(span=26, adjust=False).mean()
-            macd = ema12 - ema26
-            ax.plot(macd, label="MACD")
-            ax.set_title("MACD Indicator")
+        elif chart_type == "scatter":
+            x_col, y_col = df.columns[:2]
+            plt.scatter(df[x_col], df[y_col], alpha=0.7)
+            plt.xlabel(x_col)
+            plt.ylabel(y_col)
+            plt.title(question)
+
+        elif chart_type == "hist":
+            val_col = df.select_dtypes(include='number').columns[0]
+            plt.hist(df[val_col], bins=20, color="orange", edgecolor="black")
+            plt.xlabel(val_col)
+            plt.title(question)
+
+        elif chart_type == "heatmap":
+            numeric_df = df.select_dtypes(include='number')
+            corr = numeric_df.corr()
+            sns.heatmap(corr, annot=True, cmap="coolwarm")
+            plt.title("Correlation Heatmap")
 
         else:
-            return ""
+            raise ValueError(f"Unsupported chart type: {chart_type}")
 
-        ax.legend()
-        buf = BytesIO()
-        plt.savefig(buf, format='png')
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png")
         plt.close()
         buf.seek(0)
-        image_base64 = base64.b64encode(buf.read()).decode('utf-8')
+        image_base64 = base64.b64encode(buf.read()).decode("utf-8")
         return image_base64
 
     except Exception as e:
-        print(f"Lỗi vẽ biểu đồ {metric_name}: {e}")
-        return ""
+        print(f"❌ Lỗi vẽ biểu đồ ({chart_type}): {e}")
+        return None
