@@ -12,6 +12,7 @@ import faiss
 import pickle
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any, Tuple
+from difflib import get_close_matches
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -22,7 +23,7 @@ from operator import itemgetter
 from langchain_community.tools.tavily_search import TavilySearchResults
 from typing_extensions import TypedDict
 from finance_metrics import load_formulas, identify_metric, get_required_fields, compute_metric
-from plot_metric import plot_metric
+from plot_metric import plot_chart
 from langgraph.graph import StateGraph, END
 from IPython.display import Markdown, display
 
@@ -73,6 +74,12 @@ def get_vector_store_and_retriever(resource_dir: str = "sec_embeddings") -> Tupl
 
 
 # =======================Create A Query Retrieval Grader=======================
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_openai import ChatOpenAI
+from langchain_core.documents import Document
+
+# Create LLM config Pydantic V2
 llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
 
 # Parser
@@ -80,18 +87,28 @@ parser = StrOutputParser()
 
 # Prompt system
 SYS_PROMPT = """
-You are an expert grader assessing relevance of a retrieved document to a user question.
-Answer only 'yes' or 'no' depending on whether the document is relevant to the question.
+You are an expert grader assessing whether a retrieved document contains relevant information to answer a user question.
+
+Please follow these rules:
+- Answer ONLY 'yes' or 'no'
+- If the document contains a numeric value, table, or sentence that directly answers the question (even partially), say 'yes'
+- Do NOT require exact match in wording; focus on meaning and key facts
+- Ignore formatting or markdown
+
+Be strict only when the document has no factual value for the question.
 """
 
-# create prompt template
+
+# Create prompt template
 grade_prompt = ChatPromptTemplate.from_messages([
     ("system", SYS_PROMPT),
     ("human", "Retrieved document:\n{document}\n\nUser question:\n{question}")
 ])
 
-# create chain
+# Create chain
 doc_grader = grade_prompt | llm | parser
+
+
 
 # =======================Build A QA RAG Chain=======================
 # Create RAG prompt for response generation
@@ -206,36 +223,63 @@ def generate_sql_query(user_question, schema_info=None):
 You are a PostgreSQL expert. You are working with a financial database containing two structured tables: "djia_prices" and "djia_companies".
 
 IMPORTANT:
-PostgreSQL is case-sensitive **only when using quoted identifiers**.
-You MUST wrap column names in double quotes (e.g. "Ticker", "Close", "Date", etc.)
-Do NOT use unquoted identifiers like Ticker or Close - they will cause errors.
+- PostgreSQL is case-sensitive **only when using quoted identifiers**.
+- You MUST wrap column names in double quotes (e.g. "Ticker", "Close", "Date").
+- When comparing date values, always use `"Date"::date = 'YYYY-MM-DD'` to match correctly against date input.
+- NEVER use `"Date" = 'YYYY-MM-DD'` because "Date" is stored as TIMESTAMPTZ.
 
-Table 1: "djia_prices" - Daily stock trading data per company
-- "Date" (TIMESTAMPTZ): The timestamp of the trading day.
-- "Open" (FLOAT): Opening price of the stock on that day.
-- "High" (FLOAT): Highest price reached during the trading day.
-- "Low" (FLOAT): Lowest price of the stock during the trading day.
-- "Close" (FLOAT): Closing price of the stock on that day.
-- "Volume" (BIGINT): Number of shares traded on that day.
-- "Dividends" (FLOAT): Dividend payout on that day, if any.
-- "Stock_Splits" (FLOAT): Stock split ratio applied on that day (e.g. 2.0 = 2-for-1 split).
-- "Ticker" (VARCHAR): The stock symbol of the company (e.g., AAPL, MSFT).
+Table 1: "djia_prices"
+{{
+"Date" (TIMESTAMPTZ),
+"Open" (FLOAT),
+"High" (FLOAT),
+"Low" (FLOAT),
+"Close" (FLOAT),
+"Volume" (BIGINT),
+"Dividends" (FLOAT),
+"Stock_Splits" (FLOAT),
+"Ticker" (VARCHAR)
+}}
 
-Table 2: "djia_companies" - Company profile information
-- "symbol" (VARCHAR): The stock symbol matching the "Ticker" in "djia_prices".
-- "name" (TEXT): Full name of the company.
-- "sector" (TEXT): Main sector of operation (e.g., Technology, Healthcare).
-- "industry" (TEXT): More specific industry classification (e.g., Consumer Electronics).
-- "country" (TEXT): Country where the company is headquartered.
-- "market_cap" (FLOAT): Market capitalization in USD.
-- "pe_ratio" (FLOAT): Price-to-Earnings ratio of the company.
-- "dividend_yield" (FLOAT): Annual dividend yield expressed as a percentage.
-- "description" (TEXT): A short textual description of the company's operations.
+Table 2: "djia_companies"
+{{
+"symbol" (VARCHAR),
+"name" (TEXT),
+"sector" (TEXT),
+"industry" (TEXT),
+"country" (TEXT),
+"market_cap" (FLOAT),
+"pe_ratio" (FLOAT),
+"dividend_yield" (FLOAT),
+"description" (TEXT)
+}}
 
 Use this schema to write the most accurate and optimized PostgreSQL query to answer the following question.
 
-Do NOT format the query in markdown or explain the result.
-Return ONLY the raw SQL.
+IMPORTANT:
+- DO NOT use subqueries on "djia_companies" to find the ticker by name.
+- Instead, directly use the stock symbol (e.g. 'BA', 'AAPL', 'MSFT') when querying djia_prices.
+- Assume the correct ticker will be matched externally by the system.
+
+IMPORTANT:
+- You MUST return only valid PostgreSQL SQL code.
+- DO NOT include explanation, comments, markdown, or Python code.
+- Return a single SQL query that can be executed directly.
+- Do not say "this is a data science task".
+- Assume the system will compute correlation and generate charts separately using Python.
+
+IMPORTANT:
+- Do NOT pivot data or return multiple tickers as columns.
+- Always return raw data in long-form: one row per Ticker per Date.
+- Required columns: "Date", "Ticker", "Close"
+- The system will compute correlation separately.
+
+
+Do NOT format the query in markdown. Return ONLY the raw SQL.
+
+- If the user asks for market capitalization by sector as of a specific date (e.g. April 26, 2025), you should just use the static table "djia_companies".
+- DO NOT use a subquery with "djia_prices" based on date.
+
 
 User Question:
 {user_question}
@@ -254,6 +298,7 @@ User Question:
         return None
 
 
+
 def execute_sql_query(conn, query):
     try:
         df = pd.read_sql(query, conn)
@@ -261,30 +306,6 @@ def execute_sql_query(conn, query):
     except Exception as e:
         print(f"❌ Lỗi thực thi SQL: {e}")
         return None
-
-def run_chat(question: str):
-    conn = connect_to_database()
-    if conn is None:
-        return
-
-    schema_info = get_schema_and_samples(conn)
-    sql_query = generate_sql_query(question, schema_info)
-
-    if not sql_query:
-        print("❌ Không thể sinh truy vấn SQL.")
-        return
-
-    print(f"\n🧠 SQL sinh ra:\n{sql_query}")
-    results = execute_sql_query(conn, sql_query)
-
-    if results is None:
-        print("❌ Truy vấn lỗi.")
-        return
-
-    print("\n📊 Kết quả:")
-    print(results.head(5))
-
-    conn.close()
 
 
 # =======================Build Agentic RAG components=======================
@@ -342,6 +363,13 @@ def grade_documents(state):
 
     if documents:
         for d in documents:
+            # If the document is from SQL → always pass it through
+            if d.metadata.get("source") == "sql":
+                print("✅ Bỏ qua grading (nguồn: SQL) → giữ lại")
+                filtered_docs.append(d)
+                continue
+
+            # The rest is to use LLM grading.
             score = doc_grader.invoke(
                 {"question": question, "document": d.page_content}
             )
@@ -353,128 +381,147 @@ def grade_documents(state):
             else:
                 print("❌ GRADE: DOCUMENT NOT RELEVANT")
     else:
-        print("Không có tài liệu nào từ vector DB.")
+        print("⚠️ Không có tài liệu nào để chấm điểm.")
 
     return {
         **state,
         "documents": filtered_docs
     }
 
+
 # Use SQL
-# Danh sách 30 mã cổ phiếu DJIA (bạn có thể cập nhật thêm nếu cần)
 DJIA_TICKERS = {
     "AAPL", "MSFT", "AMGN", "AXP", "BA", "CAT", "CRM", "CSCO", "CVX", "DIS",
     "DOW", "GS", "HD", "HON", "IBM", "INTC", "JNJ", "JPM", "KO", "MCD",
-    "MMM", "MRK", "MSFT", "NKE", "PG", "TRV", "UNH", "V", "VZ", "WMT"
+    "MMM", "MRK", "NKE", "PG", "TRV", "UNH", "V", "VZ", "WMT"
 }
 
-def extract_ticker_from_question(question: str) -> str | None:
-    """
-    Extracts stock ticker symbol from user question by matching against DJIA tickers.
-    Returns the first match found, or None if no match.
-    """
-    question = question.upper()
-    for ticker in DJIA_TICKERS:
-        if re.search(rf"\\b{ticker}\\b", question):
-            print(f"✅ Detected ticker in question: {ticker}")
+
+def map_company_name_to_ticker(question: str, mapping: dict) -> str | None:
+    question_lower = question.lower()
+    
+    # Tìm tên công ty khớp gần nhất
+    matched_names = get_close_matches(question_lower, mapping.keys(), n=1, cutoff=0.4)
+
+    if matched_names:
+        matched = matched_names[0]
+        print(f"✅ Gần đúng: '{matched}' → {mapping[matched]}")
+        return mapping[matched]
+
+    # Nếu không khớp fuzzy, fallback về in-string match
+    for name, ticker in mapping.items():
+        if name in question_lower:
+            print(f"✅ Ánh xạ trực tiếp: '{name}' → {ticker}")
             return ticker
-    print("⚠️ No DJIA ticker found in question.")
+
+    print("⚠️ Không ánh xạ được công ty nào.")
     return None
+def get_name_to_ticker_mapping(conn):
+    cursor = conn.cursor()
+    cursor.execute('SELECT name, symbol FROM djia_companies')
+    result = cursor.fetchall()
+    cursor.close()
+
+    # Chuẩn hóa name về lowercase và bỏ từ dư (Inc., Corp., Company,...)
+    clean_mapping = {}
+    for name, symbol in result:
+        name_clean = name.lower().replace("inc.", "").replace("corporation", "").replace("company", "").replace("(the)", "").strip()
+        clean_mapping[name_clean] = symbol
+
+    return clean_mapping
+
+def extract_tickers_from_question(question: str, conn=None) -> list:
+    question_upper = question.upper()
+
+    # ✅ Tách câu thành các từ viết hoa (loại bỏ dấu câu)
+    tokens = set(re.findall(r'\b[A-Z]{2,5}\b', question_upper))
+
+    # ✅ So khớp với DJIA_TICKERS
+    tickers = [token for token in tokens if token in DJIA_TICKERS]
+
+    # ✅ Kết hợp ánh xạ tên công ty nếu có DB
+    if conn:
+        mapping = get_name_to_ticker_mapping(conn)
+        question_lower = question.lower()
+
+        matched_names = get_close_matches(question_lower, mapping.keys(), n=5, cutoff=0.4)
+        for name in matched_names:
+            ticker = mapping[name]
+            if ticker not in tickers:
+                tickers.append(ticker)
+
+        for name, ticker in mapping.items():
+            if name in question_lower and ticker not in tickers:
+                tickers.append(ticker)
+
+    print(f"✅ Ticker(s) detected: {tickers}")
+    return tickers
+
+
+def extract_rolling_window(question: str, default: int = 30) -> int:
+    match = re.search(r"(\d+)[- ]day rolling average", question.lower())
+    if match:
+        return int(match.group(1))
+    return default
 
 
 def detect_chart_type(question: str):
     q = question.lower()
-    if "scatter plot" in q:
+
+    if "scatter" in q or "scatter plot" in q:
         return "scatter"
-    if "bar chart" in q:
+    if "bar chart" in q or "barplot" in q or "bar plot" in q:
         return "bar"
-    if "pie chart" in q:
+    if "pie chart" in q or "pie" in q:
         return "pie"
-    if "boxplot" in q:
+    if "boxplot" in q or "box plot" in q:
         return "box"
-    if "histogram" in q:
+    if "histogram" in q or "hist" in q:
         return "hist"
-    if "heatmap" in q:
+    if "heatmap" in q or "correlation matrix" in q:
         return "heatmap"
+    if "time series" in q or "plot the closing price" in q or "line chart" in q or "time-series" in q:
+        return "line"
+    if "rolling average" in q or "moving average" in q:
+        return "line_ma"
+    if "cumulative return" in q:
+        return "cumulative"
+    if "dividend" in q:
+        return "dividend"
+    if "high-low range" in q or "daily range" in q:
+        return "range"
+
     return None
+
+
 
 def query_sql(state):
     print("---EXECUTE RAW SQL QUERY OR METRIC COMPUTATION---")
     question = state["question"]
-    metadata = load_formulas()
-    category, metric_name = identify_metric(question, metadata)
 
+    # Bước 1: Kết nối DB
     conn = connect_to_database()
     if conn is None:
-        raise ValueError("Không thể kết nối cơ sở dữ liệu.")
+        raise ValueError("❌ Không thể kết nối cơ sở dữ liệu.")
 
-    if metric_name:
-        print(f"📌 Identified metric: {metric_name} ({category})")
-
-        if category == "TA":
-            ticker = extract_ticker_from_question(question)
-            if not ticker:
-                conn.close()
-                raise ValueError("❌ Cannot determine stock ticker from the question.")
-
-            query = (
-                f'SELECT "Date", "Open", "High", "Low", "Close", "Volume" '
-                f'FROM djia_prices WHERE "Ticker" = \'{ticker}\' ORDER BY "Date" ASC'
-            )
-            print(f"🧠 SQL Query:\n{query}")
-            df = pd.read_sql(query, conn)
-            conn.close()
-            df.rename(columns={"Date": "date"}, inplace=True)
-
-
-            image_base64 = plot_metric(metric_name, df)
-            result_doc = Document(
-                page_content=f"Chart of {metric_name} for AAPL:",
-                metadata={"image_base64": image_base64}
-            )
-            return {
-                "documents": state["documents"] + [result_doc],
-                "question": question
-            }
-
-        elif category == "FA":
-            ticker = extract_ticker_from_question(question)
-            if not ticker:
-                conn.close()
-                raise ValueError("❌ Cannot determine stock ticker from the question.")
-
-            required_fields = get_required_fields(category, metric_name, metadata)
-            query = f"SELECT {', '.join(required_fields)} FROM djia_companies WHERE symbol = '{ticker}' LIMIT 1;"
-            print(f"🧠 SQL Query:\n{query}")
-            df = pd.read_sql(query, conn)
-            conn.close()
-
-
-            if df.empty:
-                result_str = f"⚠️ Không tìm thấy đủ dữ liệu để tính {metric_name}."
-            else:
-                result = compute_metric(metric_name, df.iloc[0].to_dict())
-                result_str = f"{metric_name} = {result}"
-
-            return {
-                "documents": state["documents"] + [Document(page_content=result_str)],
-                "question": question
-            }
-
-    # Natural language → SQL case
+    # Bước 2: Trích xuất schema + sample để đưa vào prompt LLM
     schema_info = get_schema_and_samples(conn)
+
+    # Bước 3: Dùng LLM sinh SQL truy vấn
     sql_query = generate_sql_query(question, schema_info)
     if not sql_query:
         conn.close()
-        raise ValueError("❌ Cannot generate SQL query from question.")
+        raise ValueError("❌ Không thể sinh truy vấn SQL từ câu hỏi.")
 
     print(f"🧠 Generated SQL Query:\n{sql_query}")
+
+    # Bước 4: Thực thi SQL
     df = execute_sql_query(conn, sql_query)
     conn.close()
 
+    # Bước 5: Nếu không có kết quả → fallback sang web
     if df is None or df.empty:
-        content = "⚠️ No results returned from SQL query."
-        state["web_search_needed"] = "Yes"
+        print("⚠️ SQL trả về rỗng. Cần dùng web search.")
         return {
             "documents": state["documents"],
             "question": question,
@@ -482,19 +529,135 @@ def query_sql(state):
             "web_search_needed": "Yes"
         }
 
+    # Bước 6: Nếu câu hỏi yêu cầu biểu đồ
     chart_type = detect_chart_type(question)
     if chart_type:
         print(f"📊 Detected chart type: {chart_type}")
-        image_base64 = plot_fa_chart(df, chart_type, question)
-        result_doc = Document(
-            page_content=f"Visualization for: {question}",
-            metadata={"image_base64": image_base64}
-        )
+
+        # Process separately for the heatmap chart
+        if chart_type == "heatmap":
+            print("📊 Detected heatmap request — building correlation matrix.")
+
+            conn = connect_to_database()
+            tickers = extract_tickers_from_question(question, conn)
+            if not tickers:
+                conn.close()
+                return {
+                    **state,
+                    "generation": "⚠️ Không tìm thấy mã cổ phiếu trong câu hỏi để vẽ heatmap."
+                }
+
+            tickers_str = "', '".join(tickers)
+            sql_query = f"""
+                SELECT "Date", "Ticker", "Close"
+                FROM "djia_prices"
+                WHERE "Date"::date BETWEEN '2024-01-01' AND '2024-12-31'
+                AND "Ticker" IN ('{tickers_str}')
+                ORDER BY "Date"
+            """
+
+            print(f"🧠 SQL Query for heatmap:\n{sql_query}")
+            df = pd.read_sql(sql_query, conn)
+            conn.close()
+
+            if df.empty:
+                return {
+                    **state,
+                    "generation": "⚠️ Không có dữ liệu cho các mã cổ phiếu trong năm 2024."
+                }
+
+            # Chuẩn hóa returns theo từng ticker
+            df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce")
+            df = df.dropna(subset=["Date", "Close", "Ticker"])
+
+            # Pivot: mỗi ticker là 1 cột, mỗi hàng là 1 ngày
+            pivot_df = df.pivot(index="Date", columns="Ticker", values="Close")
+            returns_df = pivot_df.pct_change().dropna()
+
+            if returns_df.shape[1] < 2:
+                return {
+                    **state,
+                    "generation": "⚠️ Không đủ mã cổ phiếu có dữ liệu để tính tương quan."
+                }
+
+            # Vẽ heatmap từ returns
+            image_base64 = plot_chart(returns_df, "heatmap", question)
+
+            result_doc = Document(
+                page_content="📊 Correlation heatmap of daily returns generated below.",
+                metadata={"image_base64": image_base64, "source": "sql"}
+            )
+
+            return {
+                "documents": state["documents"] + [result_doc],
+                "question": question,
+                "sql_query": sql_query,
+                "web_search_needed": "No"
+            }
+
+
+
+
+        
+        if chart_type == "line_ma":
+            window = extract_rolling_window(question)
+            ma_col = f"MA_{window}"
+            df["Date"] = pd.to_datetime(df["Date"], utc=True)
+            df[ma_col] = df["Close"].rolling(window=window).mean()
+            df_chart = df[["Date", "Close", ma_col]]
+
+            image_base64 = plot_chart(df_chart, chart_type, question)
+
+            result_doc = Document(
+                page_content=f"📊 Chart generated: {chart_type}",
+                metadata={"image_base64": image_base64, "source": "sql"}
+            )
+
+            return {
+                "documents": state["documents"] + [result_doc],
+                "question": question,
+                "sql_query": sql_query,
+                "web_search_needed": "No"
+            }
+
+
+
+        if df is not None and not df.empty:
+            df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce")
+            df = df.dropna(subset=["Date"])
+            
+            image_base64 = plot_chart(df, chart_type, question)
+
+            if image_base64:
+                result_doc = Document(
+                    page_content=f"📊 The requested chart has been generated below.",
+                    metadata={"image_base64": image_base64, "source": "sql"}
+                )
+            else:
+                result_doc = Document(
+                    page_content=f"⚠️ Failed to generate chart.",
+                    metadata={"source": "sql"}
+                )
+            return {
+                "documents": state["documents"] + [result_doc],
+                "question": question,
+                "sql_query": sql_query,
+                "web_search_needed": "No"
+            }
+        else:
+            result_doc = Document(
+                page_content="⚠️ No data available for charting.",
+                metadata={"source": "sql"}
+            )
+
     else:
+        # Nếu không phải câu hỏi yêu cầu biểu đồ → trả kết quả dạng bảng
         result_doc = Document(
-            page_content=f"📊 SQL Query Result:\n\n{df.to_markdown(index=False)}"
+            page_content=f"📊 SQL Query Result:\n\n{df.to_markdown(index=False)}",
+            metadata={"source": "sql"}
         )
 
+    # Trả kết quả về state
     return {
         "documents": state["documents"] + [result_doc],
         "question": question,
@@ -504,13 +667,8 @@ def query_sql(state):
 
 
 
-
-# 
+# Assess combined documents
 def assess_combined_documents(state):
-    """
-    Re-assess all documents (from vector + SQL) to determine which are relevant to the question.
-    Filters out irrelevant documents based on LLM scoring.
-    """
     print("---REASSESS COMBINED DOCUMENTS---")
 
     question = state.get("question", "")
@@ -534,11 +692,8 @@ def assess_combined_documents(state):
     }
 
 
+# Decide after reassessment
 def decide_after_reassessment(state):
-    """
-    After reassessing documents from both vector DB and SQL,
-    decide whether to proceed to generate an answer or fall back to web search.
-    """
     docs = state.get("documents", [])
     num_docs = len(docs)
     print(f"🔍 Number of relevant documents after reassessment: {num_docs}")
@@ -551,6 +706,7 @@ def decide_after_reassessment(state):
         return "rewrite_query"
 
 
+# Rewrite query
 def rewrite_query(state):
     print("---REWRITE QUERY---")
     question = state["question"]
@@ -570,7 +726,7 @@ def decide_after_sql(state):
 
 
 
-
+# Web search
 from langchain_core.documents import Document  # dùng đúng version core
 
 def web_search(state):
@@ -616,11 +772,8 @@ def web_search(state):
         print(f"❌ Error during web search: {str(e)}")
         return {"documents": documents, "question": question}
 
-
+# Generate answer
 def generate_answer(state):
-    """
-    Generate final answer using question and provided context documents.
-    """
     print("---GENERATE ANSWER---")
 
     question = state.get("question", "")
@@ -635,13 +788,23 @@ def generate_answer(state):
         return {**state, "generation": "I don't have enough context to answer the question."}
 
     try:
-        # Generate answer using the QA chain
+        # If there is a document containing an image (image_base64) → display it immediately, do not call LLM.
+        for doc in documents:
+            if isinstance(doc, Document) and doc.metadata.get("image_base64"):
+                print("✅ Found image in document → skipping LLM")
+                return {
+                    **state,
+                    "generation": "📊 The requested chart has been generated below.",
+                    "image_base64": doc.metadata["image_base64"]
+                }
+
+        # If there is no image → fallback to LLM
         generation = qa_rag_chain.invoke({
             "context": documents,
             "question": question
         })
 
-        print("✅ Answer generated.")
+        print("✅ Answer generated from LLM.")
         return {
             **state,
             "generation": generation
@@ -654,12 +817,12 @@ def generate_answer(state):
             "generation": f"Error generating answer: {str(e)}"
         }
 
+
 # =======================Build the Agent Graph with LangGraph=======================
 
 # --- Build enhanced Agentic RAG with SQL-priority + Vector fallback + multi-hop merge ---
 def create_rag_graph():
-    from langgraph.graph import StateGraph, END
-
+    # === Build Agentic RAG: vector → SQL → (chart or reassess) → answer/web ===
     agentic_rag = StateGraph(GraphState)
 
     # Add nodes
@@ -677,7 +840,7 @@ def create_rag_graph():
     # Flow: retrieve → grade_documents
     agentic_rag.add_edge("retrieve", "grade_documents")
 
-    # Sau khi grade: Nếu docs tốt → generate_answer, nếu không → query_sql
+    # If there are docs → generate_answer, if not → query_sql
     agentic_rag.add_conditional_edges(
         "grade_documents",
         lambda state: "generate_answer" if len(state.get("documents", [])) >= 1 else "query_sql",
@@ -687,8 +850,29 @@ def create_rag_graph():
         }
     )
 
-    agentic_rag.add_edge("query_sql", "assess_combined_documents")
+    def decide_after_query_sql(state):
+        question = state.get("question", "")
+        if detect_chart_type(question):
+            print("---DECISION: This is a charting question → generate_answer")
+            return "generate_answer"
+        elif state.get("web_search_needed", "No") == "Yes":
+            print("---DECISION: SQL failed → fallback to rewrite_query")
+            return "rewrite_query"
+        else:
+            print("---DECISION: Proceed to reassess documents")
+            return "assess_combined_documents"
 
+    agentic_rag.add_conditional_edges(
+        "query_sql",
+        decide_after_query_sql,
+        {
+            "generate_answer": "generate_answer",
+            "rewrite_query": "rewrite_query",
+            "assess_combined_documents": "assess_combined_documents"
+        }
+    )
+
+    # Next flow from reassess
     agentic_rag.add_conditional_edges(
         "assess_combined_documents",
         decide_after_reassessment,  # return "generate_answer" or "rewrite_query"
@@ -698,11 +882,11 @@ def create_rag_graph():
         }
     )
 
-    # Web search flow
+    # Web search → generate answer
     agentic_rag.add_edge("rewrite_query", "web_search")
     agentic_rag.add_edge("web_search", "generate_answer")
 
-    # END
+    # End
     agentic_rag.add_edge("generate_answer", END)
 
     return agentic_rag.compile()
